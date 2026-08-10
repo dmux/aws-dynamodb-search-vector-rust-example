@@ -1,0 +1,29 @@
+[package]
+name = "agent-memory-client"
+description = "MemoryService over HTTP, signed with SigV4 for an API Gateway execute-api endpoint."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+agent-memory-contract.workspace = true
+agent-memory-core.workspace = true
+async-trait.workspace = true
+aws-config.workspace = true
+aws-credential-types.workspace = true
+aws-sigv4.workspace = true
+aws-smithy-runtime-api.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,17 @@
+[package]
+name = "agent-memory-contract"
+description = "Wire DTOs shared by the Lambda and the HTTP client so the two sides cannot drift apart."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

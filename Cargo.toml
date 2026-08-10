@@ -1,0 +1,77 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/agent-memory-core",
+    "crates/agent-memory-contract",
+    "crates/agent-memory-aws",
+    "crates/agent-memory-client",
+    "crates/agent-memory-lambda",
+    "crates/agent-memory-mcp",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+repository = "https://github.com/dmux/aws-dynamodb-search-vector-rust-example"
+
+[workspace.dependencies]
+agent-memory-core = { path = "crates/agent-memory-core" }
+agent-memory-contract = { path = "crates/agent-memory-contract" }
+agent-memory-aws = { path = "crates/agent-memory-aws" }
+agent-memory-client = { path = "crates/agent-memory-client" }
+
+# `SearchVectors` and the `VectorIndex` types landed in the 2026-08-04 service
+# model update. Anything below 1.120 simply does not have the operation.
+aws-sdk-dynamodb = "1.120"
+aws-sdk-bedrockruntime = "1.139"
+aws-config = { version = "1.10", features = ["behavior-version-latest"] }
+aws-credential-types = "1.2"
+aws-sigv4 = "1.5"
+aws-smithy-types = "1"
+aws-smithy-runtime-api = "1"
+
+lambda_http = "1.3"
+lambda_runtime = "1.3"
+rmcp = "3.1"
+
+anyhow = "1"
+async-trait = "0.1"
+futures = "0.3"
+# reqwest 0.13 renamed the TLS features: `rustls`, not `rustls-tls`.
+# Native certs rather than a bundled root store, so the MCP server keeps working
+# behind a corporate TLS-inspecting proxy.
+reqwest = { version = "0.13", default-features = false, features = [
+    "rustls",
+    "rustls-native-certs",
+    "http2",
+    "json",
+] }
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+todo = "warn"
+unwrap_used = "warn"
+
+[profile.release]
+# Lambda cares about cold start: a smaller binary loads faster.
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+# `panic = "abort"` would shrink the binary further, but it also stops
+# lambda_runtime from turning a panic into a normal error response: the whole
+# process would die and the caller would get an opaque runtime failure.
+# Graceful 500s are worth more here than the few saved kilobytes.

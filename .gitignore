@@ -1,0 +1,15 @@
+/target
+**/*.rs.bk
+
+# Terraform. Note .terraform.lock.hcl is intentionally NOT ignored: the provider
+# lock belongs in version control so everyone plans against the same versions.
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!example.tfvars
+crash.log
+tfplan
+
+# Local MCP wiring produced by `make mcp-config`
+.mcp.json

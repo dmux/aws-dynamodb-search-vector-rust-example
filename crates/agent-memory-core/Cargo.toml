@@ -1,0 +1,23 @@
+[package]
+name = "agent-memory-core"
+description = "Domain model, ports and use cases for the agent memory layer. Free of any AWS dependency."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+
+[features]
+# Exposes the in-memory port implementations so that the driving adapters
+# (Lambda, MCP) can test against the domain with no network and no AWS.
+testing = []
+
+[lints]
+workspace = true

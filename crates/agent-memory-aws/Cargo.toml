@@ -1,0 +1,33 @@
+[package]
+name = "agent-memory-aws"
+description = "Driven adapters: DynamoDB vector search and Bedrock Titan embeddings."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+agent-memory-core.workspace = true
+async-trait.workspace = true
+# `SearchVectors` requires >= 1.120 (2026-08-04 service model update).
+aws-sdk-dynamodb.workspace = true
+aws-sdk-bedrockruntime.workspace = true
+aws-smithy-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+# `admin::wait_until_searchable` polls DescribeTable: there is no AWS waiter for
+# vector index readiness.
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+agent-memory-core = { workspace = true, features = ["testing"] }
+aws-config.workspace = true
+aws-sdk-bedrockruntime.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true
