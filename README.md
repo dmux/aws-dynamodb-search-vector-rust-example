@@ -90,6 +90,26 @@ accidental import fails the build rather than quietly eroding the boundary.
 | `agent-memory-lambda` | Driving adapter: the HTTP API | core, contract, aws |
 | `agent-memory-mcp` | Driving adapter: MCP over stdio | core, client |
 
+## The Claude Code plugin
+
+Three tools is the right size for a protocol surface and not enough to get good
+memory behaviour: left alone, an agent recalls every turn — an embedding plus a
+billed vector search each time — stores conversational debris that crowds out
+signal, and cannot answer *"what do you know about me?"* at all, because the API
+has no list endpoint.
+
+[`plugins/agent-memory`](plugins/agent-memory/README.md) is the layer that
+supplies that judgement: skills for curation, recall strategy, auditing, ops and
+contributing; agents that curate a session, audit the store, and review a diff
+against this repo's architectural invariants; and a hook that journals every
+write locally so the store can be audited despite having no list endpoint.
+
+```
+/plugin marketplace add .
+/plugin install agent-memory@agent-memory
+/memory-setup
+```
+
 ## Documentation
 
 | Document | What it covers |
@@ -100,6 +120,7 @@ accidental import fails the build rather than quietly eroding the boundary.
 | [Cost](docs/cost.md) | Verified pricing, why HTTP APIs, and where the money actually goes |
 | [Deployment](docs/deployment.md) | Prerequisites, Terraform, the vector-index escape hatch, IAM |
 | [MCP server](docs/mcp.md) | Tools, wiring it to a client, why tool descriptions are prompts |
+| [Claude Code plugin](plugins/agent-memory/README.md) | Skills, agents, commands and the write journal layered over the MCP tools |
 | [Testing](docs/testing.md) | What runs for free, what costs money, and the two open verifications |
 
 ## Status

@@ -1,0 +1,10 @@
+{
+  "name": "agent-memory",
+  "description": "Curation, recall strategy, auditing and operations for the agent-memory MCP server backed by DynamoDB vector search and Bedrock Titan embeddings.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Rafael Sales"
+  },
+  "homepage": "https://github.com/rafaelsales/aws-dynamodb-search-vector-rust-example",
+  "license": "MIT"
+}
