@@ -1,0 +1,17 @@
+{
+  "description": "Journals every agent-memory write locally, so the store can be audited despite having no list endpoint.",
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "mcp__agent-memory__memory_remember|mcp__agent-memory__memory_forget",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/journal.py\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

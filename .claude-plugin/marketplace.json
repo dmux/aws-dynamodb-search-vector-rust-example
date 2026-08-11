@@ -1,0 +1,16 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "agent-memory",
+  "description": "The Claude Code layer for the agent-memory MCP server: skills, agents and commands that turn three raw memory tools into a curated, auditable long-term memory.",
+  "owner": {
+    "name": "Rafael Sales"
+  },
+  "plugins": [
+    {
+      "name": "agent-memory",
+      "description": "Curation, recall strategy, auditing and operations for the agent-memory MCP server backed by DynamoDB vector search.",
+      "source": "./plugins/agent-memory",
+      "category": "productivity"
+    }
+  ]
+}
