@@ -49,7 +49,7 @@ variable "lambda_memory_mb" {
     and how fast a 1024-float response is parsed.
   EOT
   type        = number
-  default     = 512
+  default     = 128
 }
 
 variable "lambda_timeout_seconds" {
