@@ -110,10 +110,17 @@ create_index() {
   # of global secondary indexes; the integration test
   # `adding_a_vector_index_can_register_its_search_schema_attribute` is what
   # verifies it also holds for a vector index.
+  local existing_attrs
+  existing_attrs="$(aws dynamodb describe-table --table-name "$TABLE_NAME" --query "Table.AttributeDefinitions" --output json)"
+  local merged_attrs
+  merged_attrs="$(jq -c --arg attr "$filter_attribute" '
+    . + [{"AttributeName": $attr, "AttributeType": "S"}] | unique_by(.AttributeName)
+  ' <<<"$existing_attrs")"
+
   log "creating vector index ${INDEX_NAME} on ${TABLE_NAME}"
   aws dynamodb update-table \
     --table-name "$TABLE_NAME" \
-    --attribute-definitions "AttributeName=${filter_attribute},AttributeType=S" \
+    --attribute-definitions "$merged_attrs" \
     --vector-index-updates "$(jq -n --argjson index "$config" '[{Create: $index}]')" \
     >/dev/null
 

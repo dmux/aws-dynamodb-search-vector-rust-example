@@ -65,9 +65,12 @@ resource "aws_dynamodb_table" "memories" {
   # The escape hatch adds `kind` to the table's AttributeDefinitions. Without
   # this, every subsequent plan would see an attribute it did not declare and
   # try to remove it, which would in turn break the vector index.
-  lifecycle {
-    ignore_changes = [attribute]
-  }
+  # Update: We cannot ignore_changes on attribute because it causes validateTableAttributes
+  # to fail during plan, as the provider sees the attribute but no index using it.
+  # Let's try removing it.
+  # lifecycle {
+  #   ignore_changes = [attribute]
+  # }
 }
 
 # ---------------------------------------------------------------------------
