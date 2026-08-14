@@ -268,8 +268,28 @@ fn to_error_data(error: MemoryError) -> ErrorData {
         ErrorData::invalid_params(error.to_string(), None)
     } else {
         tracing::error!(error = ?error, "memory operation failed");
-        ErrorData::internal_error(error.to_string(), None)
+        ErrorData::internal_error(explain(&error), None)
     }
+}
+
+/// The whole chain, not just the outermost message.
+///
+/// `MemoryError::Repository` displays as "repository failure" and keeps the
+/// reason as a `#[source]`. Reporting only the head therefore tells the caller
+/// nothing: a missing AWS profile, an expired SSO session and a genuinely
+/// unreachable table are one indistinguishable string, and the stderr log the
+/// detail would have gone to belongs to a server the caller cannot see. Since
+/// this crosses to an agent rather than to an end user, the causes are worth
+/// far more than the tidiness of hiding them.
+fn explain(error: &dyn std::error::Error) -> String {
+    let mut message = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        message.push_str(": ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    message
 }
 
 #[cfg(test)]

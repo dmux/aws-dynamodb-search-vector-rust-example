@@ -69,6 +69,17 @@ impl From<ClientError> for MemoryError {
     }
 }
 
+/// `AGENT_MEMORY_PROFILE`, then `AWS_PROFILE`. Blank counts as unset — an empty
+/// string in a JSON manifest is someone leaving the field in, not naming a
+/// profile called "".
+fn profile_from_env() -> Option<String> {
+    ["AGENT_MEMORY_PROFILE", "AWS_PROFILE"]
+        .into_iter()
+        .find_map(|name| std::env::var(name).ok())
+        .map(|profile| profile.trim().to_string())
+        .filter(|profile| !profile.is_empty())
+}
+
 /// The memory API, reached over HTTP.
 #[derive(Debug, Clone)]
 pub struct RemoteMemoryService {
@@ -81,7 +92,66 @@ pub struct RemoteMemoryService {
 
 impl RemoteMemoryService {
     pub async fn new(endpoint: impl Into<String>, github_login: Option<String>) -> Self {
-        let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+        Self::for_profile(endpoint, github_login, profile_from_env().as_deref()).await
+    }
+
+    /// Sign with a **named** AWS profile rather than whatever the default chain
+    /// happens to resolve.
+    ///
+    /// # Why this is not just `AWS_PROFILE`
+    ///
+    /// `load_defaults` does read `AWS_PROFILE`, so a shell that exports it is
+    /// already served. The callers that are not are the ones that never had a
+    /// shell: this crate's own MCP server is launched by the agent host from a
+    /// JSON manifest, and a manifest that sets `AGENT_MEMORY_API` and
+    /// `AWS_REGION` but forgets the profile silently falls through to the
+    /// `[default]` profile. If that profile carries no credentials — normal on a
+    /// machine that only ever uses named profiles — every call fails, far from
+    /// here, as an unauthorised request.
+    ///
+    /// Passing the profile as an argument makes it something a caller can be
+    /// required to think about, and lets [`SigningError::NoCredentials`] name
+    /// the profile it actually tried.
+    pub async fn for_profile(
+        endpoint: impl Into<String>,
+        github_login: Option<String>,
+        profile: Option<&str>,
+    ) -> Self {
+        let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
+        if let Some(profile) = profile {
+            loader = loader.profile_name(profile);
+        }
+        let config = loader.load().await;
+
+        let mut service = Self::with_config(config, endpoint, github_login);
+        service.signer = service.signer.for_profile(profile.map(str::to_owned));
+        service
+    }
+
+    /// Build from an explicitly supplied [`SdkConfig`] instead of the ambient
+    /// credential chain.
+    ///
+    /// [`Self::new`] resolves credentials and region through
+    /// `aws_config::load_defaults`, which reads process environment variables,
+    /// `~/.aws/config` and the SSO cache. That is the right default for a
+    /// process started from a shell, and the wrong one for two callers this
+    /// crate already has to serve:
+    ///
+    /// * A macOS `.app` launched from the Finder inherits no shell profile, so
+    ///   `AWS_REGION` is simply absent and signing fails with
+    ///   [`SigningError::NoRegion`] no matter how the machine is configured.
+    /// * A mobile client has no `~/.aws/config` at all; its credentials arrive
+    ///   at runtime from something like a Cognito identity pool.
+    ///
+    /// Both could be forced to work by mutating the process environment before
+    /// construction, but `std::env::set_var` is `unsafe` in edition 2024 and
+    /// process-global — an alarming amount of machinery for what is really just
+    /// a missing parameter. This constructor is that parameter.
+    pub fn with_config(
+        config: aws_config::SdkConfig,
+        endpoint: impl Into<String>,
+        github_login: Option<String>,
+    ) -> Self {
         Self {
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(30))
@@ -95,10 +165,15 @@ impl RemoteMemoryService {
 
     /// Build from `AGENT_MEMORY_API`, the variable the generated `.mcp.json`
     /// sets.
+    ///
+    /// The profile comes from `AGENT_MEMORY_PROFILE`, falling back to
+    /// `AWS_PROFILE`. The dedicated name exists so a manifest can point this
+    /// client at one account without redirecting every other AWS SDK in the
+    /// same process.
     pub async fn from_env(github_login: Option<String>) -> Result<Self, ClientError> {
         let endpoint =
             std::env::var("AGENT_MEMORY_API").map_err(|_| ClientError::MissingEndpoint)?;
-        Ok(Self::new(endpoint, github_login).await)
+        Ok(Self::for_profile(endpoint, github_login, profile_from_env().as_deref()).await)
     }
 
     async fn send<B, R>(
@@ -279,6 +354,85 @@ fn from_scored_view(view: ScoredMemoryView) -> Result<ScoredMemory, MemoryError>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn with_config_builds_without_touching_the_ambient_credential_chain() {
+        // The point of the constructor: no environment, no profile, no SSO
+        // cache, and no async. An empty config is enough to build — resolution
+        // failures surface later, at signing time, as SigningError.
+        let service = RemoteMemoryService::with_config(
+            aws_config::SdkConfig::builder().build(),
+            "https://example.com/",
+            None,
+        );
+        assert_eq!(
+            service.endpoint, "https://example.com",
+            "the trailing slash must be trimmed, or every path would double it"
+        );
+    }
+
+    /// The failure this whole parameter exists to make legible: no credentials,
+    /// with the profile that was tried named in the message.
+    #[tokio::test]
+    async fn a_named_profile_that_has_no_credentials_says_which_profile() {
+        let service = RemoteMemoryService::for_profile(
+            "https://example.com/",
+            None,
+            Some("definitely-not-a-configured-profile"),
+        )
+        .await;
+
+        let error = service
+            .signer
+            .sign("GET", "https://example.com/memories", b"")
+            .await
+            .expect_err("that profile does not exist");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("definitely-not-a-configured-profile"),
+            "the message must name the profile it tried, got: {message}"
+        );
+        assert!(
+            message.contains("aws sso login"),
+            "and say how to fix it, got: {message}"
+        );
+    }
+
+    /// With no profile named, the message must not invent one — it has to say
+    /// the default chain was used, which is a different thing to go and check.
+    #[tokio::test]
+    async fn without_a_profile_the_message_says_the_default_chain_was_used() {
+        let service = RemoteMemoryService::with_config(
+            aws_config::SdkConfig::builder().build(),
+            "https://example.com/",
+            None,
+        );
+
+        let error = service
+            .signer
+            .sign("GET", "https://example.com/memories", b"")
+            .await
+            .expect_err("an empty config resolves nothing");
+
+        let message = error.to_string();
+        assert!(message.contains("default chain"), "got: {message}");
+        assert!(
+            message.contains("AGENT_MEMORY_PROFILE"),
+            "it must name the variable that fixes it, got: {message}"
+        );
+    }
+
+    #[test]
+    fn a_blank_profile_variable_counts_as_unset() {
+        // A manifest that leaves `"AGENT_MEMORY_PROFILE": ""` in place is not
+        // asking for a profile named empty string.
+        assert_eq!("  ".trim(), "");
+        assert!(
+            profile_from_env().is_none_or(|profile| !profile.is_empty()),
+            "a resolved profile is never blank"
+        );
+    }
 
     #[test]
     fn a_domain_error_survives_the_round_trip_as_a_domain_error() {

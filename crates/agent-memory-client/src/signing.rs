@@ -15,7 +15,21 @@ const SERVICE: &str = "execute-api";
 
 #[derive(Debug, thiserror::Error)]
 pub enum SigningError {
-    #[error("no AWS credentials available; configure a profile or set AWS_ACCESS_KEY_ID")]
+    /// Names the profile, because "no credentials" and "no credentials *for the
+    /// profile you asked for*" send the reader to different places — and the
+    /// second is what happens when a launcher forgets to pass one and the
+    /// default profile turns out to be empty.
+    #[error("no AWS credentials for profile `{profile}`; run `aws sso login --profile {profile}`")]
+    NoCredentialsForProfile {
+        profile: String,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[error(
+        "no AWS credentials available and no profile was requested, so the default chain was \
+         used; set AGENT_MEMORY_PROFILE or AWS_PROFILE, or set AWS_ACCESS_KEY_ID"
+    )]
     NoCredentials(#[source] Box<dyn std::error::Error + Send + Sync>),
 
     #[error("no AWS region configured; set AWS_REGION")]
@@ -28,11 +42,34 @@ pub enum SigningError {
 #[derive(Debug, Clone)]
 pub struct Signer {
     config: SdkConfig,
+    /// The profile the config was built from, if one was named. Carried only so
+    /// a credentials failure can say which one it tried; `SdkConfig` does not
+    /// remember.
+    profile: Option<String>,
 }
 
 impl Signer {
     pub fn new(config: SdkConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            profile: None,
+        }
+    }
+
+    /// Record which named profile this signer's credentials came from.
+    pub fn for_profile(mut self, profile: Option<String>) -> Self {
+        self.profile = profile;
+        self
+    }
+
+    fn no_credentials(&self, source: Box<dyn std::error::Error + Send + Sync>) -> SigningError {
+        match &self.profile {
+            Some(profile) => SigningError::NoCredentialsForProfile {
+                profile: profile.clone(),
+                source,
+            },
+            None => SigningError::NoCredentials(source),
+        }
     }
 
     /// Produce the `Authorization` and related headers for one request.
@@ -48,11 +85,11 @@ impl Signer {
         let provider = self
             .config
             .credentials_provider()
-            .ok_or_else(|| SigningError::NoCredentials("no provider configured".into()))?;
+            .ok_or_else(|| self.no_credentials("no provider configured".into()))?;
         let credentials = provider
             .provide_credentials()
             .await
-            .map_err(|error| SigningError::NoCredentials(Box::new(error)))?;
+            .map_err(|error| self.no_credentials(Box::new(error)))?;
         let region = self.config.region().ok_or(SigningError::NoRegion)?;
 
         let identity = credentials.into();
