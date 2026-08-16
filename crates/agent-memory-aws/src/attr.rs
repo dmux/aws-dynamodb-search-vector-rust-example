@@ -29,6 +29,9 @@ pub const ATTR_CREATED_AT: &str = "created_at";
 pub const ATTR_EXPIRES_AT: &str = "expires_at";
 pub const ATTR_SOURCE: &str = "source";
 pub const ATTR_GITHUB_LOGIN: &str = "github_login";
+pub const ATTR_GITHUB_REPO: &str = "github_repo";
+pub const ATTR_RATING: &str = "rating";
+pub const ATTR_ACTIVE: &str = "active";
 
 /// The vector **as stored on an item**: a DynamoDB list (`L`) of numbers (`N`).
 pub fn to_item_attr(embedding: &Embedding) -> AttributeValue {
@@ -96,6 +99,19 @@ pub fn to_item(
             AttributeValue::S(login.clone()),
         );
     }
+    if let Some(repo) = &memory.github_repo {
+        item.insert(
+            ATTR_GITHUB_REPO.to_string(),
+            AttributeValue::S(repo.clone()),
+        );
+    }
+    if let Some(rating) = memory.rating {
+        item.insert(
+            ATTR_RATING.to_string(),
+            AttributeValue::N(rating.to_string()),
+        );
+    }
+    item.insert(ATTR_ACTIVE.to_string(), AttributeValue::Bool(memory.active));
 
     Ok(item)
 }
@@ -114,6 +130,9 @@ pub fn memory_from_item(item: &HashMap<String, AttributeValue>) -> Result<Memory
         expires_at: optional_number_field(item, ATTR_EXPIRES_AT)?.map(from_epoch_seconds),
         source: optional_string_field(item, ATTR_SOURCE)?.map(str::to_string),
         github_login: optional_string_field(item, ATTR_GITHUB_LOGIN)?.map(str::to_string),
+        github_repo: optional_string_field(item, ATTR_GITHUB_REPO)?.map(str::to_string),
+        rating: optional_number_field(item, ATTR_RATING)?.map(|n| n as u8),
+        active: optional_bool_field(item, ATTR_ACTIVE)?.unwrap_or(true),
     })
 }
 
@@ -153,6 +172,22 @@ fn optional_string_field<'a>(
                     expected: "S",
                 })
         }
+    }
+}
+
+fn optional_bool_field(
+    item: &HashMap<String, AttributeValue>,
+    name: &'static str,
+) -> Result<Option<bool>, ItemError> {
+    match item.get(name) {
+        None => Ok(None),
+        Some(value) => value
+            .as_bool()
+            .map(|b| Some(*b))
+            .map_err(|_| ItemError::UnexpectedType {
+                name,
+                expected: "BOOL",
+            }),
     }
 }
 
@@ -206,6 +241,9 @@ mod tests {
             expires_at: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_003_600)),
             source: Some("mcp".to_string()),
             github_login: Some("dmux".to_string()),
+            github_repo: None,
+            rating: None,
+            active: true,
         }
     }
 
@@ -255,6 +293,7 @@ mod tests {
             expires_at: None,
             source: None,
             github_login: None,
+            github_repo: None,
             ..sample_memory()
         };
         let item = to_item(&memory, &sample_embedding()).expect("serialises");

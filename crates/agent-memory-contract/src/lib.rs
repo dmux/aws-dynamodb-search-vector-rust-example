@@ -16,7 +16,22 @@
 //! user's memories by editing a payload. Responses do echo the resolved
 //! `user_id` back, which is what the smoke test asserts on.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+
+/// Deserialize a field that has to tell "absent" from "explicitly null".
+///
+/// `Option<Option<T>>` alone does not do it: serde's own `Option` impl maps a
+/// JSON `null` onto the *outer* `None`, so a null and a missing key arrive
+/// identically. Only `#[serde(default, deserialize_with = "double_option")]`
+/// separates them — the default supplies `None` when the key is absent, and
+/// this wraps whatever was actually present in `Some`.
+fn double_option<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: Deserializer<'de>,
+{
+    Deserialize::deserialize(deserializer).map(Some)
+}
 
 /// `POST /memories`
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -31,6 +46,16 @@ pub struct RememberRequest {
     /// Attribution label only; never used to authorize anything.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub github_login: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_repo: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rating: Option<u8>,
+    #[serde(default = "default_true")]
+    pub active: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// `POST /memories/search`
@@ -63,6 +88,10 @@ pub struct MemoryView {
     pub source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub github_login: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_repo: Option<String>,
+    pub rating: Option<u8>,
+    pub active: bool,
 }
 
 /// A search hit. `distance` follows the domain convention: lower is closer.
@@ -71,6 +100,38 @@ pub struct ScoredMemoryView {
     #[serde(flatten)]
     pub memory: MemoryView,
     pub distance: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ListMemoriesResponse {
+    pub memories: Vec<MemoryView>,
+    /// Pass back as `?cursor=` for the next page. Absent means the end — and it
+    /// is the only thing that does.
+    ///
+    /// A short page is not the end: the filter is applied after the page is
+    /// read, so a page can arrive empty with thousands of rows still behind it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// A partial edit. An absent field is one the caller is not touching.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct UpdateMemoryRequest {
+    pub text: Option<String>,
+    pub kind: Option<String>,
+    pub ttl_seconds: Option<u64>,
+    /// The one field where absent and `null` mean different things: absent
+    /// leaves the rating alone, `null` clears it. See [`double_option`] for why
+    /// the plain type is not enough — and `skip_serializing_if` for the other
+    /// half, without which every request would send an explicit `null` and
+    /// erase the rating on any update that never mentioned it.
+    #[serde(
+        default,
+        deserialize_with = "double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub rating: Option<Option<u8>>,
+    pub active: Option<bool>,
 }
 
 /// Search results.
@@ -117,6 +178,56 @@ mod tests {
     use super::*;
 
     #[test]
+    fn an_absent_rating_and_a_null_rating_are_different_requests() {
+        // The whole reason `rating` is doubly optional. If these two parsed the
+        // same, un-rating a memory would be impossible to say over HTTP and the
+        // star would come back on the next read.
+        let absent: UpdateMemoryRequest =
+            serde_json::from_str(r#"{"text":null,"kind":null,"ttl_seconds":null,"active":null}"#)
+                .expect("valid");
+        assert_eq!(absent.rating, None, "absent means leave it alone");
+
+        let cleared: UpdateMemoryRequest = serde_json::from_str(
+            r#"{"text":null,"kind":null,"ttl_seconds":null,"rating":null,"active":null}"#,
+        )
+        .expect("valid");
+        assert_eq!(cleared.rating, Some(None), "null means clear it");
+
+        let set: UpdateMemoryRequest = serde_json::from_str(
+            r#"{"text":null,"kind":null,"ttl_seconds":null,"rating":4,"active":null}"#,
+        )
+        .expect("valid");
+        assert_eq!(set.rating, Some(Some(4)));
+    }
+
+    #[test]
+    fn an_update_that_does_not_mention_the_rating_does_not_send_one() {
+        // Without `skip_serializing_if`, this would serialise `"rating":null` —
+        // and the receiver, correctly, would read that as "clear it". Every
+        // edit of a memory's text would silently erase its rating.
+        let request = UpdateMemoryRequest {
+            text: Some("texto novo".to_string()),
+            kind: None,
+            ttl_seconds: None,
+            rating: None,
+            active: None,
+        };
+
+        let json = serde_json::to_string(&request).expect("serialises");
+        assert!(!json.contains("rating"), "{json}");
+
+        let clearing = UpdateMemoryRequest {
+            rating: Some(None),
+            ..request
+        };
+        assert!(
+            serde_json::to_string(&clearing)
+                .expect("serialises")
+                .contains(r#""rating":null"#)
+        );
+    }
+
+    #[test]
     fn remember_request_omits_absent_optionals() {
         let request = RememberRequest {
             kind: "preference".into(),
@@ -124,11 +235,14 @@ mod tests {
             ttl_seconds: None,
             source: None,
             github_login: None,
+            github_repo: None,
+            rating: None,
+            active: true,
         };
         let json = serde_json::to_string(&request).expect("serialises");
         assert_eq!(
             json,
-            r#"{"kind":"preference","text":"I prefer pour-over coffee"}"#
+            r#"{"kind":"preference","text":"I prefer pour-over coffee","active":true}"#
         );
     }
 
@@ -162,6 +276,9 @@ mod tests {
                 expires_at: None,
                 source: None,
                 github_login: None,
+                github_repo: None,
+                rating: None,
+                active: true,
             },
             distance: 0.25,
         };

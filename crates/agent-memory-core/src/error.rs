@@ -28,6 +28,9 @@ pub enum MemoryError {
     #[error("top_k must be between 1 and {max}, got {requested}")]
     TopKOutOfRange { requested: u32, max: u32 },
 
+    #[error("limit must be between 1 and {max}, got {requested}")]
+    PageSizeOutOfRange { requested: u32, max: u32 },
+
     #[error("distance must be finite, got {0}")]
     NonFiniteDistance(f32),
 
@@ -36,6 +39,12 @@ pub enum MemoryError {
 
     #[error("identifier must not be empty")]
     EmptyIdentifier,
+
+    /// Raised by `update`, which edits and cannot create. `forget` deliberately
+    /// does not raise it: deleting something already absent is the outcome the
+    /// caller asked for.
+    #[error("no memory with id {0}")]
+    NotFound(String),
 
     #[error("repository failure")]
     Repository(#[source] BoxError),
@@ -66,6 +75,7 @@ impl MemoryError {
                 | Self::NonFiniteEmbeddingValue { .. }
                 | Self::DimensionMismatch { .. }
                 | Self::TopKOutOfRange { .. }
+                | Self::PageSizeOutOfRange { .. }
                 | Self::NonFiniteDistance(_)
                 | Self::UnknownMemoryKind(_)
                 | Self::EmptyIdentifier

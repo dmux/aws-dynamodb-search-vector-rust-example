@@ -17,7 +17,7 @@ const CONSISTENCY_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
-    let service = RemoteMemoryService::from_env(Some("smoke-test".to_string())).await?;
+    let service = RemoteMemoryService::from_env(Some("smoke-test".to_string()), None).await?;
 
     // The value below is deliberately never sent: the client omits the user id
     // entirely and the server derives it from the SigV4 principal.
@@ -37,8 +37,11 @@ async fn main() -> anyhow::Result<()> {
             // Expire on its own so a smoke run leaves nothing behind even if
             // the delete at the end never happens.
             ttl: Some(Duration::from_secs(3600)),
-            source: Some("smoke".to_string()),
+            source: None,
             github_login: None,
+            github_repo: None,
+            rating: None,
+            active: true,
         })
         .await?;
 

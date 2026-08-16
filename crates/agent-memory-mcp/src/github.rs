@@ -41,6 +41,30 @@ pub async fn detect_login() -> Option<String> {
     if login.is_empty() { None } else { Some(login) }
 }
 
+/// The name of the locally active GitHub repository, if there is one.
+pub async fn detect_repo() -> Option<String> {
+    let output = Command::new("gh")
+        .args([
+            "repo",
+            "view",
+            "--json",
+            "nameWithOwner",
+            "--jq",
+            ".nameWithOwner",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let repo = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    if repo.is_empty() { None } else { Some(repo) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

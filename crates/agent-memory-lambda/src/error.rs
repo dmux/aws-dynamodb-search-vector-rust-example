@@ -30,6 +30,9 @@ impl ApiError {
             Self::Principal(_) => 401,
             Self::BadRequest(_) => 400,
             Self::NotFound { .. } => 404,
+            // A missing memory is a 404 like a missing route, not a 400: the
+            // request was well formed and the thing it named is simply gone.
+            Self::Domain(MemoryError::NotFound(_)) => 404,
             Self::Domain(error) if error.is_invalid_input() => 400,
             Self::Domain(_) => 500,
         }
@@ -41,7 +44,7 @@ impl ApiError {
         match self {
             Self::Principal(_) => "unidentified_caller",
             Self::BadRequest(_) => "invalid_request",
-            Self::NotFound { .. } => "not_found",
+            Self::NotFound { .. } | Self::Domain(MemoryError::NotFound(_)) => "not_found",
             Self::Domain(error) if error.is_invalid_input() => "invalid_input",
             Self::Domain(_) => "internal_error",
         }

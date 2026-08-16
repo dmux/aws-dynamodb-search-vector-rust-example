@@ -32,11 +32,12 @@ async fn main() -> anyhow::Result<()> {
     // still yields a working server. The GitHub token is never read or sent —
     // see `github` for why.
     let github_login = github::detect_login().await;
+    let github_repo = github::detect_repo().await;
     if let Some(login) = &github_login {
-        tracing::info!(github_login = %login, "attributing memories to GitHub user");
+        tracing::info!(github_login = %login, github_repo = ?github_repo, "attributing memories to GitHub user");
     }
 
-    let service = RemoteMemoryService::from_env(github_login).await?;
+    let service = RemoteMemoryService::from_env(github_login, github_repo).await?;
     tracing::info!("agent-memory MCP server ready on stdio");
 
     let server = MemoryTools::new(Arc::new(service)).serve(stdio()).await?;

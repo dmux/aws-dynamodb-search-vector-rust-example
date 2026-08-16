@@ -69,6 +69,36 @@ impl From<ClientError> for MemoryError {
     }
 }
 
+/// `AGENT_MEMORY_PROFILE`, then `AWS_PROFILE`. Blank counts as unset — an empty
+/// string in a JSON manifest is someone leaving the field in, not naming a
+/// profile called "".
+/// Percent-encode a query-string value the way SigV4 canonicalisation expects.
+///
+/// Everything outside the unreserved set is escaped — including `/`, `~`'s
+/// neighbours and the space, which some encoders render as `+`. SigV4 does not
+/// accept `+`, so a repository name with a space would sign one way and travel
+/// another.
+fn percent_encode(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(*byte as char);
+            }
+            other => encoded.push_str(&format!("%{other:02X}")),
+        }
+    }
+    encoded
+}
+
+fn profile_from_env() -> Option<String> {
+    ["AGENT_MEMORY_PROFILE", "AWS_PROFILE"]
+        .into_iter()
+        .find_map(|name| std::env::var(name).ok())
+        .map(|profile| profile.trim().to_string())
+        .filter(|profile| !profile.is_empty())
+}
+
 /// The memory API, reached over HTTP.
 #[derive(Debug, Clone)]
 pub struct RemoteMemoryService {
@@ -77,11 +107,83 @@ pub struct RemoteMemoryService {
     signer: signing::Signer,
     /// Attribution label attached to writes. Never used for authorization.
     github_login: Option<String>,
+    github_repo: Option<String>,
 }
 
 impl RemoteMemoryService {
-    pub async fn new(endpoint: impl Into<String>, github_login: Option<String>) -> Self {
-        let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+    pub async fn new(
+        endpoint: impl Into<String>,
+        github_login: Option<String>,
+        github_repo: Option<String>,
+    ) -> Self {
+        Self::for_profile(
+            endpoint,
+            github_login,
+            github_repo,
+            profile_from_env().as_deref(),
+        )
+        .await
+    }
+
+    /// Sign with a **named** AWS profile rather than whatever the default chain
+    /// happens to resolve.
+    ///
+    /// # Why this is not just `AWS_PROFILE`
+    ///
+    /// `load_defaults` does read `AWS_PROFILE`, so a shell that exports it is
+    /// already served. The callers that are not are the ones that never had a
+    /// shell: this crate's own MCP server is launched by the agent host from a
+    /// JSON manifest, and a manifest that sets `AGENT_MEMORY_API` and
+    /// `AWS_REGION` but forgets the profile silently falls through to the
+    /// `[default]` profile. If that profile carries no credentials — normal on a
+    /// machine that only ever uses named profiles — every call fails, far from
+    /// here, as an unauthorised request.
+    ///
+    /// Passing the profile as an argument makes it something a caller can be
+    /// required to think about, and lets [`SigningError::NoCredentials`] name
+    /// the profile it actually tried.
+    pub async fn for_profile(
+        endpoint: impl Into<String>,
+        github_login: Option<String>,
+        github_repo: Option<String>,
+        profile: Option<&str>,
+    ) -> Self {
+        let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
+        if let Some(profile) = profile {
+            loader = loader.profile_name(profile);
+        }
+        let config = loader.load().await;
+
+        let mut service = Self::with_config(config, endpoint, github_login, github_repo);
+        service.signer = service.signer.for_profile(profile.map(str::to_owned));
+        service
+    }
+
+    /// Build from an explicitly supplied [`SdkConfig`] instead of the ambient
+    /// credential chain.
+    ///
+    /// [`Self::new`] resolves credentials and region through
+    /// `aws_config::load_defaults`, which reads process environment variables,
+    /// `~/.aws/config` and the SSO cache. That is the right default for a
+    /// process started from a shell, and the wrong one for two callers this
+    /// crate already has to serve:
+    ///
+    /// * A macOS `.app` launched from the Finder inherits no shell profile, so
+    ///   `AWS_REGION` is simply absent and signing fails with
+    ///   [`SigningError::NoRegion`] no matter how the machine is configured.
+    /// * A mobile client has no `~/.aws/config` at all; its credentials arrive
+    ///   at runtime from something like a Cognito identity pool.
+    ///
+    /// Both could be forced to work by mutating the process environment before
+    /// construction, but `std::env::set_var` is `unsafe` in edition 2024 and
+    /// process-global — an alarming amount of machinery for what is really just
+    /// a missing parameter. This constructor is that parameter.
+    pub fn with_config(
+        config: aws_config::SdkConfig,
+        endpoint: impl Into<String>,
+        github_login: Option<String>,
+        github_repo: Option<String>,
+    ) -> Self {
         Self {
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(30))
@@ -90,15 +192,75 @@ impl RemoteMemoryService {
             endpoint: endpoint.into().trim_end_matches('/').to_string(),
             signer: signing::Signer::new(config),
             github_login,
+            github_repo,
         }
     }
 
     /// Build from `AGENT_MEMORY_API`, the variable the generated `.mcp.json`
     /// sets.
-    pub async fn from_env(github_login: Option<String>) -> Result<Self, ClientError> {
+    ///
+    /// The profile comes from `AGENT_MEMORY_PROFILE`, falling back to
+    /// `AWS_PROFILE`. The dedicated name exists so a manifest can point this
+    /// client at one account without redirecting every other AWS SDK in the
+    /// same process.
+    pub async fn from_env(
+        github_login: Option<String>,
+        github_repo: Option<String>,
+    ) -> Result<Self, ClientError> {
         let endpoint =
             std::env::var("AGENT_MEMORY_API").map_err(|_| ClientError::MissingEndpoint)?;
-        Ok(Self::new(endpoint, github_login).await)
+        Ok(Self::for_profile(
+            endpoint,
+            github_login,
+            github_repo,
+            profile_from_env().as_deref(),
+        )
+        .await)
+    }
+
+    /// Build `?a=b&c=d` for a listing, or an empty string when nothing is set.
+    ///
+    /// Values are percent-encoded here rather than left to `reqwest`, because
+    /// the very same URL string is what gets signed: SigV4 canonicalises the
+    /// query, and a `/` in a repository name that one side escapes and the
+    /// other does not is a signature mismatch reported as a 403 — which reads
+    /// exactly like an expired login and is not one.
+    fn list_query_string(query: &agent_memory_core::ListQuery) -> String {
+        let mut pairs: Vec<(&str, String)> = vec![("limit", query.limit.get().to_string())];
+
+        if let Some(cursor) = &query.cursor {
+            pairs.push(("cursor", cursor.to_string()));
+        }
+
+        let filter = &query.filter;
+        if let Some(kind) = filter.kind {
+            pairs.push(("kind", kind.to_string()));
+        }
+        if let Some(repo) = &filter.github_repo {
+            pairs.push(("repo", repo.clone()));
+        }
+        if let Some(login) = &filter.github_login {
+            pairs.push(("login", login.clone()));
+        }
+        if let Some(source) = &filter.source {
+            pairs.push(("source", source.clone()));
+        }
+        if let Some(active) = filter.active {
+            pairs.push(("active", active.to_string()));
+        }
+        if let Some(rating) = filter.min_rating {
+            pairs.push(("min_rating", rating.to_string()));
+        }
+        if let Some(text) = &filter.text_contains {
+            pairs.push(("q", text.clone()));
+        }
+
+        let encoded: Vec<String> = pairs
+            .into_iter()
+            .map(|(name, value)| format!("{name}={}", percent_encode(&value)))
+            .collect();
+
+        format!("?{}", encoded.join("&"))
     }
 
     async fn send<B, R>(
@@ -185,6 +347,9 @@ impl MemoryService for RemoteMemoryService {
             ttl_seconds: command.ttl.map(|ttl| ttl.as_secs()),
             source: command.source,
             github_login: command.github_login.or_else(|| self.github_login.clone()),
+            github_repo: command.github_repo.or_else(|| self.github_repo.clone()),
+            rating: command.rating,
+            active: command.active,
         };
 
         let view: MemoryView = self
@@ -250,6 +415,62 @@ impl MemoryService for RemoteMemoryService {
             Err(error) => Err(MemoryError::from(error)),
         }
     }
+
+    async fn list(
+        &self,
+        _user_id: &UserId,
+        query: &agent_memory_core::ListQuery,
+    ) -> Result<agent_memory_core::MemoryPage, MemoryError> {
+        let path = format!("/memories{}", Self::list_query_string(query));
+
+        let view: agent_memory_contract::ListMemoriesResponse = self
+            .send(reqwest::Method::GET, &path, None::<&()>)
+            .await
+            .map_err(MemoryError::from)?
+            .unwrap_or_else(|| agent_memory_contract::ListMemoriesResponse {
+                memories: vec![],
+                next_cursor: None,
+            });
+
+        Ok(agent_memory_core::MemoryPage {
+            memories: view
+                .memories
+                .into_iter()
+                .map(from_view)
+                .collect::<Result<Vec<_>, _>>()?,
+            next: view
+                .next_cursor
+                .map(agent_memory_core::Cursor::new)
+                .transpose()?,
+        })
+    }
+
+    async fn update(
+        &self,
+        command: agent_memory_core::UpdateCommand,
+    ) -> Result<Memory, MemoryError> {
+        let request = agent_memory_contract::UpdateMemoryRequest {
+            text: command.text,
+            kind: command.kind.map(|k| k.to_string()),
+            ttl_seconds: command.ttl.map(|t| t.as_secs()),
+            rating: command.rating,
+            active: command.active,
+        };
+        let view: MemoryView = self
+            .send(
+                reqwest::Method::PUT,
+                &format!("/memories/{}", command.memory_id),
+                Some(&request),
+            )
+            .await
+            .map_err(MemoryError::from)?
+            .ok_or_else(|| {
+                MemoryError::repository(Box::new(ClientError::Decode(serde_json::Error::io(
+                    std::io::Error::other("the API returned no body for an update"),
+                ))) as BoxError)
+            })?;
+        from_view(view)
+    }
 }
 
 fn from_view(view: MemoryView) -> Result<Memory, MemoryError> {
@@ -266,6 +487,9 @@ fn from_view(view: MemoryView) -> Result<Memory, MemoryError> {
             .map(|seconds| SystemTime::UNIX_EPOCH + Duration::from_secs(seconds)),
         source: view.source,
         github_login: view.github_login,
+        github_repo: view.github_repo,
+        rating: view.rating,
+        active: view.active,
     })
 }
 
@@ -279,6 +503,88 @@ fn from_scored_view(view: ScoredMemoryView) -> Result<ScoredMemory, MemoryError>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn with_config_builds_without_touching_the_ambient_credential_chain() {
+        // The point of the constructor: no environment, no profile, no SSO
+        // cache, and no async. An empty config is enough to build — resolution
+        // failures surface later, at signing time, as SigningError.
+        let service = RemoteMemoryService::with_config(
+            aws_config::SdkConfig::builder().build(),
+            "https://example.com/",
+            None,
+            None,
+        );
+        assert_eq!(
+            service.endpoint, "https://example.com",
+            "the trailing slash must be trimmed, or every path would double it"
+        );
+    }
+
+    /// The failure this whole parameter exists to make legible: no credentials,
+    /// with the profile that was tried named in the message.
+    #[tokio::test]
+    async fn a_named_profile_that_has_no_credentials_says_which_profile() {
+        let service = RemoteMemoryService::for_profile(
+            "https://example.com/",
+            None,
+            None,
+            Some("definitely-not-a-configured-profile"),
+        )
+        .await;
+
+        let error = service
+            .signer
+            .sign("GET", "https://example.com/memories", b"")
+            .await
+            .expect_err("that profile does not exist");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("definitely-not-a-configured-profile"),
+            "the message must name the profile it tried, got: {message}"
+        );
+        assert!(
+            message.contains("aws sso login"),
+            "and say how to fix it, got: {message}"
+        );
+    }
+
+    /// With no profile named, the message must not invent one — it has to say
+    /// the default chain was used, which is a different thing to go and check.
+    #[tokio::test]
+    async fn without_a_profile_the_message_says_the_default_chain_was_used() {
+        let service = RemoteMemoryService::with_config(
+            aws_config::SdkConfig::builder().build(),
+            "https://example.com/",
+            None,
+            None,
+        );
+
+        let error = service
+            .signer
+            .sign("GET", "https://example.com/memories", b"")
+            .await
+            .expect_err("an empty config resolves nothing");
+
+        let message = error.to_string();
+        assert!(message.contains("default chain"), "got: {message}");
+        assert!(
+            message.contains("AGENT_MEMORY_PROFILE"),
+            "it must name the variable that fixes it, got: {message}"
+        );
+    }
+
+    #[test]
+    fn a_blank_profile_variable_counts_as_unset() {
+        // A manifest that leaves `"AGENT_MEMORY_PROFILE": ""` in place is not
+        // asking for a profile named empty string.
+        assert_eq!("  ".trim(), "");
+        assert!(
+            profile_from_env().is_none_or(|profile| !profile.is_empty()),
+            "a resolved profile is never blank"
+        );
+    }
 
     #[test]
     fn a_domain_error_survives_the_round_trip_as_a_domain_error() {
@@ -308,8 +614,11 @@ mod tests {
             text: "I prefer pour-over coffee".into(),
             created_at: 1_700_000_000,
             expires_at: Some(1_700_003_600),
-            source: Some("mcp".into()),
+            source: Some("hotkey".into()),
             github_login: Some("dmux".into()),
+            github_repo: None,
+            rating: None,
+            active: true,
         };
 
         let memory = from_view(view).expect("converts");
@@ -329,6 +638,9 @@ mod tests {
             expires_at: None,
             source: None,
             github_login: None,
+            github_repo: None,
+            rating: None,
+            active: true,
         };
         assert!(matches!(
             from_view(view),

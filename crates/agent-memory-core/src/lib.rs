@@ -34,7 +34,8 @@ pub mod testing;
 pub use error::{BoxError, MemoryError};
 pub use model::{Distance, Embedding, Memory, MemoryId, MemoryKind, ScoredMemory, TopK, UserId};
 pub use ports::{
-    Clock, EmbeddingProvider, IdGenerator, MemoryRepository, MemoryService, RecallQuery,
-    RememberCommand, VectorQuery,
+    Clock, Cursor, EmbeddingProvider, IdGenerator, ListQuery, MemoryFilter, MemoryPage,
+    MemoryRepository, MemoryService, PageSize, RecallQuery, RememberCommand, UpdateCommand,
+    VectorQuery,
 };
 pub use service::LocalMemoryService;

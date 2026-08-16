@@ -27,6 +27,9 @@ pub struct RememberCommand {
     pub ttl: Option<Duration>,
     pub source: Option<String>,
     pub github_login: Option<String>,
+    pub github_repo: Option<String>,
+    pub rating: Option<u8>,
+    pub active: bool,
 }
 
 /// Request to search a user's memories by meaning.
@@ -56,6 +59,137 @@ pub struct VectorQuery {
     pub kind: Option<MemoryKind>,
 }
 
+/// Where a listing resumes. Opaque to every caller above the repository.
+///
+/// It carries only the `memory_id` of the last row of the previous page: the
+/// namespace is rebuilt from the authenticated caller on the way back in, so a
+/// cursor handed to another user addresses nothing of the first user's. That is
+/// worth more than it costs — an encoded key containing `user_id` would have to
+/// be checked against the caller on every request, and forgetting that check
+/// once is a cross-namespace read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cursor(String);
+
+impl Cursor {
+    pub fn new(value: impl Into<String>) -> Result<Self, MemoryError> {
+        let value = value.into();
+        if value.trim().is_empty() {
+            return Err(MemoryError::EmptyIdentifier);
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for Cursor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// How many rows one page may contain.
+///
+/// Bounded for the same reason [`TopK`] is: the caller names a number that
+/// costs money and time downstream, so the domain decides what is sane rather
+/// than trusting a query string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageSize(u32);
+
+impl PageSize {
+    pub const MAX: u32 = 100;
+    pub const DEFAULT: Self = Self(25);
+
+    pub fn new(value: u32) -> Result<Self, MemoryError> {
+        if value == 0 || value > Self::MAX {
+            return Err(MemoryError::PageSizeOutOfRange {
+                requested: value,
+                max: Self::MAX,
+            });
+        }
+        Ok(Self(value))
+    }
+
+    pub fn get(self) -> u32 {
+        self.0
+    }
+}
+
+impl Default for PageSize {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// Narrowing applied to a listing. Every field is "and".
+///
+/// These are the memory's own metadata, not its meaning: none of this is a
+/// substitute for [`MemoryService::recall`], which is the only thing that
+/// searches by what a memory *says*. A filter answers "which memories came from
+/// that repository", never "which memories are about hexagonal architecture".
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MemoryFilter {
+    pub kind: Option<MemoryKind>,
+    pub github_repo: Option<String>,
+    pub github_login: Option<String>,
+    /// Provenance, e.g. `"echobrain-macos"` — which client wrote it.
+    pub source: Option<String>,
+    pub active: Option<bool>,
+    /// Keeps memories rated at least this highly. Unrated ones are excluded:
+    /// "at least 3 stars" is a claim about a judgement that was made.
+    pub min_rating: Option<u8>,
+    /// Substring of the text, matched literally and case-sensitively.
+    pub text_contains: Option<String>,
+}
+
+impl MemoryFilter {
+    /// Whether this narrows anything at all.
+    pub fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+/// One page of a listing.
+#[derive(Debug, Clone)]
+pub struct MemoryPage {
+    pub memories: Vec<Memory>,
+    /// `None` means the end, and it is the **only** thing that does.
+    ///
+    /// A short page is not the end. DynamoDB applies a filter *after* reading
+    /// the page, so a request for 25 rows can come back with three, or with
+    /// none at all, and still have thousands behind it. A caller that stops
+    /// when `memories.len() < limit` silently truncates the list — which is
+    /// exactly the bug an infinite scroll is built to have.
+    pub next: Option<Cursor>,
+}
+
+/// Request for one page of a user's memories, newest first.
+#[derive(Debug, Clone, Default)]
+pub struct ListQuery {
+    pub limit: PageSize,
+    /// Where to resume. `None` starts at the beginning.
+    pub cursor: Option<Cursor>,
+    pub filter: MemoryFilter,
+}
+
+/// A partial edit: a field left `None` is one the caller is not touching.
+#[derive(Debug, Clone)]
+pub struct UpdateCommand {
+    pub user_id: UserId,
+    pub memory_id: MemoryId,
+    pub text: Option<String>,
+    pub kind: Option<MemoryKind>,
+    pub ttl: Option<Duration>,
+    /// Doubly optional because a rating has three fates, not two: `None` leaves
+    /// it as it was, `Some(None)` clears it, and `Some(Some(n))` sets it.
+    /// Collapsing the first two would make un-rating impossible to express —
+    /// the caller says "no rating" and the server hears "no change".
+    pub rating: Option<Option<u8>>,
+    pub active: Option<bool>,
+}
+
 /// The semantic memory layer. This is the primary port.
 #[async_trait]
 pub trait MemoryService: Send + Sync {
@@ -71,6 +205,10 @@ pub trait MemoryService: Send + Sync {
         user_id: &UserId,
         memory_id: &MemoryId,
     ) -> Result<Option<Memory>, MemoryError>;
+
+    async fn list(&self, user_id: &UserId, query: &ListQuery) -> Result<MemoryPage, MemoryError>;
+
+    async fn update(&self, command: UpdateCommand) -> Result<Memory, MemoryError>;
 }
 
 /// Persistence and similarity search. Driven port.
@@ -95,6 +233,14 @@ pub trait MemoryRepository: Send + Sync {
         user_id: &UserId,
         memory_id: &MemoryId,
     ) -> Result<Option<Memory>, MemoryError>;
+
+    async fn list(&self, user_id: &UserId, query: &ListQuery) -> Result<MemoryPage, MemoryError>;
+
+    async fn update(
+        &self,
+        command: UpdateCommand,
+        new_embedding: Option<&Embedding>,
+    ) -> Result<Memory, MemoryError>;
 }
 
 /// Turns text into vectors. Driven port.

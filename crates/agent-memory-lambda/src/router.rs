@@ -6,8 +6,8 @@ use agent_memory_contract::{
     MemoryView, RecallRequest, RecallResponse, RememberRequest, ScoredMemoryView,
 };
 use agent_memory_core::{
-    Distance, Memory, MemoryId, MemoryKind, MemoryService, RecallQuery, RememberCommand,
-    ScoredMemory, TopK, UserId,
+    Cursor, Distance, ListQuery, Memory, MemoryFilter, MemoryId, MemoryKind, MemoryService,
+    PageSize, RecallQuery, RememberCommand, ScoredMemory, TopK, UserId,
 };
 use lambda_http::{Body, Request, RequestExt, Response};
 
@@ -38,8 +38,12 @@ async fn dispatch<S: MemoryService>(
 
     match (method.as_str(), segments.as_slice()) {
         ("POST", ["memories"]) => remember(service, &user_id, request.body()).await,
+        ("GET", ["memories"]) => list(service, &user_id, &request).await,
         ("POST", ["memories", "search"]) => recall(service, &user_id, request.body()).await,
         ("GET", ["memories", memory_id]) => get(service, &user_id, memory_id).await,
+        ("PUT", ["memories", memory_id]) => {
+            update(service, &user_id, memory_id, request.body()).await
+        }
         ("DELETE", ["memories", memory_id]) => forget(service, &user_id, memory_id).await,
         _ => Err(ApiError::NotFound {
             method: method.to_string(),
@@ -87,6 +91,9 @@ async fn remember<S: MemoryService>(
             ttl: request.ttl_seconds.map(Duration::from_secs),
             source: request.source,
             github_login: request.github_login,
+            github_repo: request.github_repo,
+            rating: request.rating,
+            active: request.active,
         })
         .await?;
 
@@ -150,6 +157,115 @@ async fn get<S: MemoryService>(
     }
 }
 
+/// `GET /memories?limit=&cursor=&kind=&repo=&login=&source=&active=&min_rating=&q=`
+///
+/// Every parameter is optional and every one narrows. Query string rather than
+/// a body because this is a `GET`: a listing has to stay cacheable and
+/// linkable, and a filter someone cannot paste into a URL is a filter they
+/// cannot report a bug about.
+async fn list<S: MemoryService>(
+    service: &S,
+    user_id: &UserId,
+    request: &Request,
+) -> Result<Response<Body>, ApiError> {
+    let params = request.query_string_parameters();
+    let param = |name: &str| {
+        params
+            .first(name)
+            .map(str::trim)
+            // A parameter present but blank — `?repo=` from a form that
+            // submitted an empty field — means "no filter", not "match the
+            // empty string", which nothing would.
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    };
+
+    let limit = match param("limit") {
+        Some(value) => {
+            let requested = value.parse::<u32>().map_err(|_| {
+                ApiError::BadRequest(format!("limit must be a number, got {value}"))
+            })?;
+            PageSize::new(requested).map_err(ApiError::Domain)?
+        }
+        None => PageSize::DEFAULT,
+    };
+
+    let cursor = param("cursor")
+        .map(Cursor::new)
+        .transpose()
+        .map_err(ApiError::Domain)?;
+
+    let filter = MemoryFilter {
+        kind: param("kind")
+            .map(|kind| kind.parse::<MemoryKind>())
+            .transpose()
+            .map_err(ApiError::Domain)?,
+        github_repo: param("repo"),
+        github_login: param("login"),
+        source: param("source"),
+        active: match param("active") {
+            Some(value) => Some(value.parse::<bool>().map_err(|_| {
+                ApiError::BadRequest(format!("active must be true or false, got {value}"))
+            })?),
+            None => None,
+        },
+        min_rating: match param("min_rating") {
+            Some(value) => Some(value.parse::<u8>().map_err(|_| {
+                ApiError::BadRequest(format!("min_rating must be a number, got {value}"))
+            })?),
+            None => None,
+        },
+        text_contains: param("q"),
+    };
+
+    let page = service
+        .list(
+            user_id,
+            &ListQuery {
+                limit,
+                cursor,
+                filter,
+            },
+        )
+        .await?;
+
+    let view = agent_memory_contract::ListMemoriesResponse {
+        memories: page.memories.iter().map(to_view).collect(),
+        next_cursor: page.next.map(|cursor| cursor.to_string()),
+    };
+    json_response(200, &view)
+}
+
+async fn update<S: MemoryService>(
+    service: &S,
+    user_id: &UserId,
+    memory_id: &str,
+    body: &Body,
+) -> Result<Response<Body>, ApiError> {
+    let memory_id = MemoryId::new(memory_id).map_err(ApiError::Domain)?;
+    let request: agent_memory_contract::UpdateMemoryRequest = parse_json(body)?;
+
+    let kind = request
+        .kind
+        .map(|k| k.parse::<MemoryKind>())
+        .transpose()
+        .map_err(ApiError::Domain)?;
+
+    let memory = service
+        .update(agent_memory_core::UpdateCommand {
+            user_id: user_id.clone(),
+            memory_id,
+            text: request.text,
+            kind,
+            ttl: request.ttl_seconds.map(Duration::from_secs),
+            rating: request.rating,
+            active: request.active,
+        })
+        .await?;
+
+    json_response(200, &to_view(&memory))
+}
+
 async fn forget<S: MemoryService>(
     service: &S,
     user_id: &UserId,
@@ -198,6 +314,9 @@ fn to_view(memory: &Memory) -> MemoryView {
         expires_at: memory.expires_at.map(epoch_seconds),
         source: memory.source.clone(),
         github_login: memory.github_login.clone(),
+        github_repo: memory.github_repo.clone(),
+        rating: memory.rating,
+        active: memory.active,
     }
 }
 

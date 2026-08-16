@@ -40,6 +40,13 @@ data "aws_iam_policy_document" "lambda" {
       "dynamodb:GetItem",
       "dynamodb:DeleteItem",
       "dynamodb:BatchWriteItem",
+      # `Query` backs the list endpoint, which reads a whole namespace by
+      # partition key; `UpdateItem` backs the partial edits behind rating and
+      # deactivation. Neither is implied by the actions above — `GetItem` does
+      # not grant `Query`, and the failure reads as a generic repository error
+      # rather than as a missing permission.
+      "dynamodb:Query",
+      "dynamodb:UpdateItem",
     ]
     resources = [aws_dynamodb_table.memories.arn]
   }
@@ -83,6 +90,10 @@ data "aws_iam_policy_document" "caller_read_only" {
     actions = ["execute-api:Invoke"]
     resources = [
       "${aws_apigatewayv2_api.memory.execution_arn}/*/POST/memories/search",
+      # The bare collection needs its own entry: the pattern below requires a
+      # slash and something after it, so it matches `GET /memories/{id}` and
+      # never `GET /memories`.
+      "${aws_apigatewayv2_api.memory.execution_arn}/*/GET/memories",
       "${aws_apigatewayv2_api.memory.execution_arn}/*/GET/memories/*",
     ]
   }

@@ -71,6 +71,67 @@ pub struct ForgetArgs {
     pub memory_id: String,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ListArgs {
+    /// How many to return, 1 to 100. Defaults to 25.
+    #[serde(default)]
+    pub limit: Option<u32>,
+    /// Opaque `next_cursor` from a previous call. Omit for the first page.
+    #[serde(default)]
+    pub cursor: Option<String>,
+    /// Keep only this kind: "fact", "preference", "episode" or "snippet".
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Keep only memories attributed to this GitHub repository, e.g.
+    /// "dmux/EchoBrain".
+    #[serde(default)]
+    pub repo: Option<String>,
+    /// Keep only memories attributed to this GitHub login.
+    #[serde(default)]
+    pub login: Option<String>,
+    /// Keep only memories written by this client, e.g. "echobrain-macos".
+    #[serde(default)]
+    pub source: Option<String>,
+    /// Keep only active memories, or only deactivated ones.
+    #[serde(default)]
+    pub active: Option<bool>,
+    /// Keep only memories rated at least this highly. Unrated ones are dropped.
+    #[serde(default)]
+    pub min_rating: Option<u8>,
+    /// Keep only memories whose text contains this exact substring. This is a
+    /// literal match, not a search: use memory_recall to find by meaning.
+    #[serde(default)]
+    pub text_contains: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct UpdateArgs {
+    /// The `memory_id` to update.
+    pub memory_id: String,
+    /// New text to store.
+    #[serde(default)]
+    pub text: Option<String>,
+    /// New kind: "fact", "preference" or "episode".
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Optional lifetime in seconds.
+    #[serde(default)]
+    pub ttl_seconds: Option<u64>,
+    /// Rating from 1 to 5. Omit to leave the current rating untouched.
+    #[serde(default)]
+    pub rating: Option<u8>,
+    /// Set true to remove the rating entirely, leaving the memory unrated.
+    ///
+    /// A separate flag rather than a null `rating`: a JSON schema that asked a
+    /// model to tell "absent" from "null" would be answered wrong most of the
+    /// time, and the wrong answer here silently erases the user's judgement.
+    #[serde(default)]
+    pub clear_rating: bool,
+    /// Active state of the memory.
+    #[serde(default)]
+    pub active: Option<bool>,
+}
+
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct RecallResult {
     pub memories: Vec<RecalledMemory>,
@@ -94,6 +155,31 @@ pub struct RememberResult {
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct ForgetResult {
     pub forgotten: bool,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct ListResult {
+    pub memories: Vec<MemoryOutput>,
+    /// Pass back as `cursor` to continue. Absent means there is no more — and
+    /// it is the only thing that does: a filtered page can come back empty with
+    /// more still behind it, so counting the rows is not a stopping rule.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct UpdateResult {
+    pub memory_id: String,
+    pub kind: String,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct MemoryOutput {
+    pub memory_id: String,
+    pub kind: String,
+    pub text: String,
+    pub rating: Option<u8>,
+    pub active: bool,
 }
 
 /// The tool surface, holding the primary port behind a trait object.
@@ -188,6 +274,9 @@ impl MemoryTools {
                 ttl: args.ttl_seconds.map(std::time::Duration::from_secs),
                 source: Some("mcp".to_string()),
                 github_login: None,
+                github_repo: None,
+                rating: None,
+                active: true,
             })
             .await
             .map_err(to_error_data)?;
@@ -214,6 +303,103 @@ impl MemoryTools {
             .await
             .map_err(to_error_data)?;
         Ok(Json(ForgetResult { forgotten: true }))
+    }
+
+    #[tool(
+        name = "memory_list",
+        description = "List all memories in the user's long-term memory. Use it when the user \
+                       explicitly asks to view or manage their memories. Do not call this to \
+                       search for information to answer a question; use memory_recall instead."
+    )]
+    async fn memory_list(
+        &self,
+        Parameters(args): Parameters<ListArgs>,
+    ) -> Result<Json<ListResult>, ErrorData> {
+        let limit = match args.limit {
+            Some(value) => agent_memory_core::PageSize::new(value).map_err(to_error_data)?,
+            None => agent_memory_core::PageSize::DEFAULT,
+        };
+        let cursor = args
+            .cursor
+            .map(agent_memory_core::Cursor::new)
+            .transpose()
+            .map_err(to_error_data)?;
+
+        let page = self
+            .service
+            .list(
+                &caller_placeholder()?,
+                &agent_memory_core::ListQuery {
+                    limit,
+                    cursor,
+                    filter: agent_memory_core::MemoryFilter {
+                        kind: parse_kind(args.kind.as_deref())?,
+                        github_repo: args.repo,
+                        github_login: args.login,
+                        source: args.source,
+                        active: args.active,
+                        min_rating: args.min_rating,
+                        text_contains: args.text_contains,
+                    },
+                },
+            )
+            .await
+            .map_err(to_error_data)?;
+
+        let out = page
+            .memories
+            .into_iter()
+            .map(|m| MemoryOutput {
+                memory_id: m.memory_id.to_string(),
+                kind: m.kind.to_string(),
+                text: m.text,
+                rating: m.rating,
+                active: m.active,
+            })
+            .collect();
+
+        Ok(Json(ListResult {
+            memories: out,
+            next_cursor: page.next.map(|cursor| cursor.to_string()),
+        }))
+    }
+
+    #[tool(
+        name = "memory_update",
+        description = "Update an existing memory's text, kind, ttl, rating, or active state. Use \
+                       it when the user explicitly asks to edit, rate, or deactivate a memory."
+    )]
+    async fn memory_update(
+        &self,
+        Parameters(args): Parameters<UpdateArgs>,
+    ) -> Result<Json<UpdateResult>, ErrorData> {
+        let memory_id = MemoryId::new(args.memory_id).map_err(to_error_data)?;
+        let kind = parse_kind(args.kind.as_deref())?;
+
+        let memory = self
+            .service
+            .update(agent_memory_core::UpdateCommand {
+                user_id: caller_placeholder()?,
+                memory_id,
+                text: args.text,
+                kind,
+                ttl: args.ttl_seconds.map(std::time::Duration::from_secs),
+                // Clearing wins over setting: a call that says both is
+                // contradictory, and erasing is the reversible half.
+                rating: match (args.clear_rating, args.rating) {
+                    (true, _) => Some(None),
+                    (false, Some(rating)) => Some(Some(rating)),
+                    (false, None) => None,
+                },
+                active: args.active,
+            })
+            .await
+            .map_err(to_error_data)?;
+
+        Ok(Json(UpdateResult {
+            memory_id: memory.memory_id.to_string(),
+            kind: memory.kind.to_string(),
+        }))
     }
 }
 
@@ -268,8 +454,28 @@ fn to_error_data(error: MemoryError) -> ErrorData {
         ErrorData::invalid_params(error.to_string(), None)
     } else {
         tracing::error!(error = ?error, "memory operation failed");
-        ErrorData::internal_error(error.to_string(), None)
+        ErrorData::internal_error(explain(&error), None)
     }
+}
+
+/// The whole chain, not just the outermost message.
+///
+/// `MemoryError::Repository` displays as "repository failure" and keeps the
+/// reason as a `#[source]`. Reporting only the head therefore tells the caller
+/// nothing: a missing AWS profile, an expired SSO session and a genuinely
+/// unreachable table are one indistinguishable string, and the stderr log the
+/// detail would have gone to belongs to a server the caller cannot see. Since
+/// this crosses to an agent rather than to an end user, the causes are worth
+/// far more than the tidiness of hiding them.
+fn explain(error: &dyn std::error::Error) -> String {
+    let mut message = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        message.push_str(": ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    message
 }
 
 #[cfg(test)]
@@ -444,7 +650,7 @@ mod tests {
         // costs an embedding plus a billed vector search.
         let router = MemoryTools::tool_router();
         let tools = router.list_all();
-        assert_eq!(tools.len(), 3);
+        assert_eq!(tools.len(), 5);
 
         for tool in tools {
             let description = tool.description.clone().unwrap_or_default();

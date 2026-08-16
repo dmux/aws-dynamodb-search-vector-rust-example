@@ -74,16 +74,19 @@ pub enum MemoryKind {
     Preference,
     /// Something that happened, tied to a point in time.
     Episode,
+    /// A technical excerpt, command, or code snippet.
+    Snippet,
 }
 
 impl MemoryKind {
-    pub const ALL: [MemoryKind; 3] = [Self::Fact, Self::Preference, Self::Episode];
+    pub const ALL: [MemoryKind; 4] = [Self::Fact, Self::Preference, Self::Episode, Self::Snippet];
 
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Fact => "fact",
             Self::Preference => "preference",
             Self::Episode => "episode",
+            Self::Snippet => "snippet",
         }
     }
 }
@@ -102,6 +105,7 @@ impl FromStr for MemoryKind {
             "fact" => Ok(Self::Fact),
             "preference" => Ok(Self::Preference),
             "episode" => Ok(Self::Episode),
+            "snippet" => Ok(Self::Snippet),
             other => Err(MemoryError::UnknownMemoryKind(other.to_string())),
         }
     }
@@ -266,6 +270,9 @@ pub struct Memory {
     pub source: Option<String>,
     /// Human-readable attribution only. Never consulted for authorization.
     pub github_login: Option<String>,
+    pub github_repo: Option<String>,
+    pub rating: Option<u8>,
+    pub active: bool,
 }
 
 /// A memory together with how close it was to the search vector.
