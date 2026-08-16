@@ -102,6 +102,9 @@ where
             expires_at: command.ttl.map(|ttl| created_at + ttl),
             source: command.source,
             github_login: command.github_login,
+            github_repo: command.github_repo,
+            rating: command.rating,
+            active: command.active,
         };
 
         self.repository.save(&memory, &embedding).await?;
@@ -140,6 +143,26 @@ where
         self.repository.delete(user_id, memory_id).await
     }
 
+    /// Straight through: listing needs no embedding, so there is nothing for
+    /// this layer to add beyond the port it already forwards.
+    async fn list(
+        &self,
+        user_id: &UserId,
+        query: &crate::ports::ListQuery,
+    ) -> Result<crate::ports::MemoryPage, MemoryError> {
+        self.repository.list(user_id, query).await
+    }
+
+    async fn update(&self, command: crate::ports::UpdateCommand) -> Result<Memory, MemoryError> {
+        let mut new_embedding = None;
+        if let Some(ref text) = command.text {
+            new_embedding = Some(self.embed_checked(text).await?);
+        }
+        self.repository
+            .update(command, new_embedding.as_ref())
+            .await
+    }
+
     async fn get(
         &self,
         user_id: &UserId,
@@ -155,6 +178,7 @@ mod tests {
 
     use super::*;
     use crate::model::{MemoryKind, TopK};
+    use crate::ports::{ListQuery, MemoryFilter, PageSize};
     use crate::testing::{FixedClock, InMemoryRepository, SeqIdGenerator, StubEmbedder};
 
     const DIMENSIONS: usize = 64;
@@ -181,6 +205,9 @@ mod tests {
             ttl: None,
             source: None,
             github_login: None,
+            github_repo: None,
+            rating: None,
+            active: true,
         }
     }
 
@@ -466,5 +493,155 @@ mod tests {
             }
         ));
         assert_eq!(service.repository.len(), 0);
+    }
+
+    /// Walk every page the way an infinite scroll does, and report what it saw.
+    async fn drain(
+        service: &LocalMemoryService<InMemoryRepository, StubEmbedder, FixedClock, SeqIdGenerator>,
+        owner: &str,
+        limit: u32,
+        filter: MemoryFilter,
+    ) -> Vec<String> {
+        let mut seen = Vec::new();
+        let mut cursor = None;
+        // The stopping rule is `next == None`, never "the page was short".
+        loop {
+            let page = service
+                .list(
+                    &user(owner),
+                    &ListQuery {
+                        limit: PageSize::new(limit).expect("a valid limit"),
+                        cursor,
+                        filter: filter.clone(),
+                    },
+                )
+                .await
+                .expect("listed");
+
+            seen.extend(page.memories.iter().map(|memory| memory.text.clone()));
+
+            match page.next {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+            assert!(seen.len() < 100, "the cursor is not advancing");
+        }
+        seen
+    }
+
+    #[tokio::test]
+    async fn paging_visits_every_memory_exactly_once() {
+        let service = service();
+        for index in 0..7 {
+            service
+                .remember(remember(
+                    &format!("memória {index}"),
+                    MemoryKind::Fact,
+                    "rafa",
+                ))
+                .await
+                .expect("remembered");
+        }
+
+        let seen = drain(&service, "rafa", 2, MemoryFilter::default()).await;
+
+        assert_eq!(seen.len(), 7, "no page was skipped or repeated");
+        let unique: std::collections::HashSet<_> = seen.iter().collect();
+        assert_eq!(unique.len(), 7);
+    }
+
+    #[tokio::test]
+    async fn a_filtered_page_can_be_empty_while_more_rows_remain() {
+        // The invariant the whole cursor contract exists for. The filter runs
+        // after the page is taken, so a caller that stops on a short page stops
+        // on the first one that filtered everything out — and shows an empty
+        // library over a full namespace.
+        let service = service();
+        for index in 0..6 {
+            service
+                .remember(remember(
+                    &format!("comum {index}"),
+                    MemoryKind::Fact,
+                    "rafa",
+                ))
+                .await
+                .expect("remembered");
+        }
+        service
+            .remember(remember("o raro", MemoryKind::Preference, "rafa"))
+            .await
+            .expect("remembered");
+
+        let wanted = MemoryFilter {
+            kind: Some(MemoryKind::Preference),
+            ..Default::default()
+        };
+
+        let first = service
+            .list(
+                &user("rafa"),
+                &ListQuery {
+                    limit: PageSize::new(2).expect("a valid limit"),
+                    cursor: None,
+                    filter: wanted.clone(),
+                },
+            )
+            .await
+            .expect("listed");
+        assert!(
+            first.memories.is_empty() && first.next.is_some(),
+            "an empty page with a cursor is not the end"
+        );
+
+        assert_eq!(
+            drain(&service, "rafa", 2, wanted).await,
+            vec!["o raro".to_string()],
+            "walking to the end still finds it"
+        );
+    }
+
+    #[tokio::test]
+    async fn filters_narrow_by_metadata_and_never_by_meaning() {
+        let service = service();
+
+        let mut from_repo = remember("usamos DynamoDB", MemoryKind::Fact, "rafa");
+        from_repo.github_repo = Some("dmux/EchoBrain".to_string());
+        from_repo.rating = Some(5);
+        service.remember(from_repo).await.expect("remembered");
+
+        let mut elsewhere = remember("usamos DynamoDB", MemoryKind::Fact, "rafa");
+        elsewhere.github_repo = Some("outro/repo".to_string());
+        service.remember(elsewhere).await.expect("remembered");
+
+        let by_repo = drain(
+            &service,
+            "rafa",
+            10,
+            MemoryFilter {
+                github_repo: Some("dmux/EchoBrain".to_string()),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(by_repo.len(), 1, "same text, different repository");
+
+        let rated = drain(
+            &service,
+            "rafa",
+            10,
+            MemoryFilter {
+                min_rating: Some(3),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(rated.len(), 1, "an unrated memory is not a badly rated one");
+    }
+
+    #[tokio::test]
+    async fn a_page_size_outside_the_bounds_is_rejected_before_any_read() {
+        assert!(PageSize::new(0).is_err());
+        assert!(PageSize::new(PageSize::MAX + 1).is_err());
+        assert!(PageSize::new(PageSize::MAX).is_ok());
     }
 }

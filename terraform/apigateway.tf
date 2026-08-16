@@ -34,8 +34,13 @@ locals {
   routes = {
     remember = "POST /memories"
     recall   = "POST /memories/search"
-    get      = "GET /memories/{memory_id}"
-    forget   = "DELETE /memories/{memory_id}"
+    # `GET /memories` and `GET /memories/{memory_id}` are two routes, not one
+    # with an optional segment: HTTP APIs match the literal path, so the bare
+    # collection is never reached by the item route.
+    list   = "GET /memories"
+    get    = "GET /memories/{memory_id}"
+    update = "PUT /memories/{memory_id}"
+    forget = "DELETE /memories/{memory_id}"
   }
 }
 

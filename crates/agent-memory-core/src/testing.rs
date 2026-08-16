@@ -198,6 +198,95 @@ impl MemoryRepository for InMemoryRepository {
         Ok(())
     }
 
+    /// Paginates the way DynamoDB does, deliberately including the part that
+    /// surprises people: the page is taken **before** the filter, so a filtered
+    /// page can be short — or empty — with more rows still to come. A fake that
+    /// filtered first would let a caller ship the "stop when the page is short"
+    /// bug and still pass its tests.
+    async fn list(
+        &self,
+        user_id: &crate::model::UserId,
+        query: &crate::ports::ListQuery,
+    ) -> Result<crate::ports::MemoryPage, MemoryError> {
+        let mut rows: Vec<Memory> = self
+            .items()
+            .iter()
+            .filter(|(memory, _)| memory.user_id == *user_id)
+            .map(|(memory, _)| memory.clone())
+            .collect();
+
+        // Newest first, with the id breaking ties so the order is total —
+        // otherwise a cursor could skip or repeat a row between requests.
+        rows.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| a.memory_id.cmp(&b.memory_id))
+        });
+
+        let start = match &query.cursor {
+            Some(cursor) => rows
+                .iter()
+                .position(|memory| memory.memory_id.to_string() == cursor.as_str())
+                .map(|index| index + 1)
+                // A cursor naming a row that has since been deleted resumes at
+                // the beginning rather than failing: the caller cannot fix it,
+                // and refusing would strand a scroll halfway.
+                .unwrap_or(0),
+            None => 0,
+        };
+
+        let limit = query.limit.get() as usize;
+        let page: Vec<Memory> = rows.iter().skip(start).take(limit).cloned().collect();
+        let next = (start + page.len() < rows.len())
+            .then(|| page.last().or(rows.get(start)))
+            .flatten()
+            .map(|memory| crate::ports::Cursor::new(memory.memory_id.to_string()))
+            .transpose()?;
+
+        Ok(crate::ports::MemoryPage {
+            memories: page
+                .into_iter()
+                .filter(|memory| matches(memory, &query.filter))
+                .collect(),
+            next,
+        })
+    }
+
+    async fn update(
+        &self,
+        command: crate::ports::UpdateCommand,
+        new_embedding: Option<&Embedding>,
+    ) -> Result<Memory, MemoryError> {
+        let mut items = self.items();
+        if let Some((existing, embedding)) = items
+            .iter_mut()
+            .find(|(m, _)| m.user_id == command.user_id && m.memory_id == command.memory_id)
+        {
+            if let Some(text) = command.text {
+                existing.text = text;
+            }
+            if let Some(kind) = command.kind {
+                existing.kind = kind;
+            }
+            // `Some(None)` clears it. See `UpdateCommand::rating`.
+            if let Some(rating) = command.rating {
+                existing.rating = rating;
+            }
+            if let Some(active) = command.active {
+                existing.active = active;
+            }
+            // `ttl` is not applied: nothing in the domain expires a memory on a
+            // clock this fake controls, so honouring it here would only invent
+            // behaviour the real repository gets from DynamoDB.
+            if let Some(new_emb) = new_embedding {
+                *embedding = new_emb.clone();
+            }
+            Ok(existing.clone())
+        } else {
+            Err(MemoryError::NotFound(command.memory_id.to_string()))
+        }
+    }
+
     async fn get(
         &self,
         user_id: &crate::model::UserId,
@@ -209,6 +298,33 @@ impl MemoryRepository for InMemoryRepository {
             .find(|(memory, _)| memory.user_id == *user_id && memory.memory_id == *memory_id)
             .map(|(memory, _)| memory.clone()))
     }
+}
+
+/// Whether a memory survives a filter.
+///
+/// Mirrors the `FilterExpression` the DynamoDB repository builds, case for
+/// case. The two drifting apart is exactly what makes a fake worse than no fake
+/// at all, so anything added on one side belongs on the other.
+fn matches(memory: &Memory, filter: &crate::ports::MemoryFilter) -> bool {
+    let same = |actual: &Option<String>, wanted: &Option<String>| match wanted {
+        Some(wanted) => actual.as_deref() == Some(wanted.as_str()),
+        None => true,
+    };
+
+    filter.kind.is_none_or(|kind| memory.kind == kind)
+        && same(&memory.github_repo, &filter.github_repo)
+        && same(&memory.github_login, &filter.github_login)
+        && same(&memory.source, &filter.source)
+        && filter.active.is_none_or(|active| memory.active == active)
+        // An unrated memory fails "at least n stars": the filter asks about a
+        // judgement, and no judgement is not a low one.
+        && filter
+            .min_rating
+            .is_none_or(|floor| memory.rating.is_some_and(|rating| rating >= floor))
+        && filter
+            .text_contains
+            .as_ref()
+            .is_none_or(|needle| memory.text.contains(needle.as_str()))
 }
 
 /// Cosine distance: `1 - cosine similarity`, matching the `COSINE` distance

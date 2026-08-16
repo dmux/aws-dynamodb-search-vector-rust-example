@@ -137,8 +137,11 @@ async fn the_full_memory_lifecycle_works_against_real_aws() {
                     kind,
                     text: text.to_string(),
                     ttl: None,
-                    source: Some("integration-test".into()),
+                    source: None,
                     github_login: None,
+                    github_repo: None,
+                    rating: None,
+                    active: true,
                 })
                 .await
                 .expect("remember succeeds")
